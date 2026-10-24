@@ -1,0 +1,13 @@
+[17:20:02.318] DEBUG probe ok: final=http://127.0.0.1:8099/big.bin size=67108864 ranges=1
+[17:20:02.318] INFO  target: http://127.0.0.1:8099/big.bin
+[17:20:02.318] INFO  size: 64.00 MiB (range requests supported)
+[17:20:02.320] INFO  downloading to: downloads\big.out (8 segments)
+[17:20:02.320] DEBUG resume checkpoint: 0 bytes committed
+[17:20:02.324] DEBUG adaptive concurrency: on (start 4, floor 4, ceiling 4)
+[17:20:02.324] DEBUG worker pool: 4 thread(s) over 8 chunk(s)
+[17:20:04.360] DEBUG resume checkpoint: 8388608 bytes committed
+[17:20:06.409] DEBUG resume checkpoint: 16777216 bytes committed
+[17:20:08.442] DEBUG resume checkpoint: 25165824 bytes committed
+[17:20:10.490] DEBUG resume checkpoint: 33554432 bytes committed
+[17:20:12.523] DEBUG resume checkpoint: 41943040 bytes committed
+[17:20:14.560] DEBUG resume checkpoint: 50331648 bytes committed

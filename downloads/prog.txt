@@ -1,0 +1,10 @@
+[17:20:58.286] INFO  target: http://127.0.0.1:8097/big.bin
+[17:20:58.286] INFO  size: 64.00 MiB (range requests supported)
+[17:20:58.287] INFO  downloading to: downloads\p.out (64 segments)
+  [=                             ]   6.2%  4.00 MiB / 64.00 MiB  7.98 MiB/s  [===                           ]  12.5%  8.00 MiB / 64.00 MiB  7.98 MiB/s  [=====                         ]  18.8%  12.00 MiB / 64.00 MiB  7.98 MiB/s  [=======                       ]  25.0%  16.00 MiB / 64.00 MiB  7.97 MiB/s  [=========                     ]  31.2%  20.00 MiB / 64.00 MiB  7.94 MiB/s  [===========                   ]  37.5%  24.00 MiB / 64.00 MiB  7.95 MiB/s  [=============                 ]  43.8%  28.00 MiB / 64.00 MiB  7.96 MiB/s  [===============               ]  50.0%  32.00 MiB / 64.00 MiB  7.90 MiB/s  [================              ]  56.2%  36.00 MiB / 64.00 MiB  7.85 MiB/s  [==================            ]  62.5%  40.00 MiB / 64.00 MiB  7.82 MiB/s  [====================          ]  68.8%  44.00 MiB / 64.00 MiB  7.87 MiB/s  [======================        ]  75.0%  48.00 MiB / 64.00 MiB  7.84 MiB/s  [========================      ]  81.2%  52.00 MiB / 64.00 MiB  7.85 MiB/s  [==========================    ]  87.5%  56.00 MiB / 64.00 MiB  7.86 MiB/s  [============================  ]  93.8%  60.00 MiB / 64.00 MiB  7.89 MiB/s[17:21:06.396] INFO  adaptive: settled at 8 of 8 connection(s) (0 ramp step(s), 0 back-off(s))
+  [==============================] 100.0%  64.00 MiB / 64.00 MiB  7.84 MiB/s
+done: downloads\p.out
+  size     : 64.00 MiB
+  segments : 64
+  elapsed  : 8.2s
+  average  : 7.84 MiB/s

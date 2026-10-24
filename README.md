@@ -1,0 +1,400 @@
+# KevinDownloader (`kdl`)
+
+A production-grade, multi-threaded HTTP/HTTPS downloader for **Windows**, written in
+modern **C++17** and built with **CMake**.
+
+`kdl` splits a remote file into several byte ranges and downloads them in parallel
+over independent HTTP connections. It survives interruptions (Ctrl+C or a hard
+kill), can resume where it left off, retries failing transfers with exponential
+backoff, and verifies the assembled file before declaring success.
+
+---
+
+## Table of contents
+
+- [Features](#features)
+- [Architecture](#architecture)
+- [Building](#building)
+- [Usage](#usage)
+- [Examples](#examples)
+- [How it works](#how-it-works)
+- [Resume semantics](#resume-semantics)
+- [Performance and tuning](#performance-and-tuning)
+- [Testing](#testing)
+- [Design notes](#design-notes)
+- [Project layout](#project-layout)
+
+---
+
+## Features
+
+| | |
+|---|---|
+| **Parallel segmented download** | The file is split into byte ranges; each range is fetched by its own worker thread with `Range: bytes=start-end`. |
+| **Adaptive concurrency** | The connection count is sized at runtime: the run ramps up while throughput improves, holds when it plateaus, and backs off only when connections start failing. `-t` is the ceiling; `--no-adaptive` pins an exact count. |
+| **Resume** | Per-segment progress is checkpointed to a `.kdlpart` sidecar every 2 seconds, so an interrupted download (even `taskkill /F`) restarts from where it stopped. |
+| **Integrity checks** | `ETag` / `Last-Modified` are recorded and re-validated on resume; `Content-Range` totals are verified against the probed size; the final byte count is checked. |
+| **SHA-256 verification** | `--sha256 <hex>` streams the finished file through Windows CNG and fails the run (exit `1`) if the digest does not match. |
+| **Retry with backoff** | Each segment has an independent retry budget (default 5) with exponential backoff; transient errors (timeouts, `429`, `503`, resets) recover automatically. |
+| **Live progress bar** | Percentage, transferred/total size and a smoothed (EWMA) rate, repainted twice a second from a dedicated monitor thread. |
+| **Graceful cancellation** | `Ctrl+C` aborts cooperatively: workers stop, progress is flushed to disk, and the exit code is `130`. |
+| **Single & multi-connection** | Falls back to a single sequential stream when the server does not support ranges or does not advertise a size. |
+| **HTTP & HTTPS** | Backed by WinHTTP, so TLS, redirects and proxies are handled by the OS stack. |
+| **Proxy support** | Uses the system proxy by default; `--proxy` overrides it. |
+| **Custom headers** | `-H "Authorization: Bearer ..."` and friends, repeatable. |
+| **Robust error handling** | A single `Error` type carries a machine-readable code; every failure has a clear message and a documented exit code. |
+
+---
+
+## Architecture
+
+The code is organized as a small static library (`kdl`) with a thin CLI in front,
+so every layer can be unit-tested or reused independently.
+
+```
+        ┌───────────────────────────────────────────────────────────┐
+        │                        src/cli                            │
+        │  Options   – argument parsing, usage / help text          │
+        └───────────────────────────┬───────────────────────────────┘
+                                    │
+        ┌───────────────────────────▼───────────────────────────────┐
+        │                     src/download                          │
+        │  Downloader – probe, plan, schedule, checkpoint, finalize │
+        │  Segment    – a byte range + its progress                 │
+        │  Progress   – lock-free counters shared with the monitor  │
+        └───────┬───────────────┬───────────────┬───────────────┬───┘
+                │               │               │               │
+     ┌──────────▼───┐  ┌────────▼─────┐  ┌──────▼──────┐  ┌─────▼──────┐
+     │  HttpClient  │  │  FileWriter  │  │ ThreadPool  │  │    Url     │
+     │  (WinHTTP)   │  │ ResumeStore  │  │ Limiter     │  │            │
+     └──────────────┘  └──────────────┘  └─────────────┘  └────────────┘
+                │               │               │               │
+        ┌───────▼───────────────▼───────────────▼───────────────▼───────┐
+        │                          src/core                             │
+        │  Error · Logger · StringUtil · ByteUtil · StopToken · Hash    │
+        └───────────────────────────────────────────────────────────────┘
+```
+
+| Module | Responsibility |
+|---|---|
+| `core` | Primitive types, the `Error` type, a thread-safe `Logger`, UTF-8/UTF-16 helpers, human-readable formatting, SHA-256 hashing (Windows CNG) and a cancellation `StopToken`. |
+| `url` | A dependency-free HTTP/HTTPS URL parser (userinfo, IPv6 literals, ports, path/query). |
+| `net` | `HttpClient`, a synchronous WinHTTP wrapper exposing plain value types (`HttpRequest`/`HttpResponse`) so nothing else needs to include `<winhttp.h>`. |
+| `io` | `FileWriter` (thread-safe positional writes on a pre-allocated file) and `ResumeStore` (atomic `.kdlpart` persistence). |
+| `thread` | A minimal, correct `ThreadPool` with `submit()` / `wait()`, and `ConcurrencyLimiter`, a resizable counting semaphore used to change the number of connections at runtime without touching the pool. |
+| `download` | The orchestrator that ties everything together. |
+
+---
+
+## Building
+
+### Requirements
+
+- Windows 10/11 (x64 or any toolchain that targets Win32)
+- CMake ≥ 3.16
+- A C++17 compiler: **MSVC 2019+** (recommended) or MinGW-w64 / clang-cl
+- The Windows SDK (for `winhttp.h`)
+
+### Configure and build
+
+```bat
+cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
+```
+
+Or with Ninja (from a *Developer Command Prompt*):
+
+```bat
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+The executable is produced at:
+
+```
+build\bin\Release\kdl.exe
+```
+
+### Install
+
+```bat
+cmake --install build --config Release --prefix C:\Tools\kdl
+```
+
+---
+
+## Usage
+
+```
+kdl [options] <url>
+```
+
+| Option | Description |
+|---|---|
+| `-o, --output <path>` | Output file **or** directory. Defaults to the name derived from `Content-Disposition` or the URL. |
+| `-r, --retries <n>` | Per-segment retry budget (default `5`). |
+| `-t, --threads <n>` | Upper bound on concurrent connections for the whole transfer (`1`–`512`, default `128`). The run starts lower and ramps up to it — see [Adaptive concurrency](#adaptive-concurrency). |
+| `--no-adaptive` | Use exactly `-t` connections instead of adjusting the count while the transfer runs. |
+| `-m, --mirror <url>` | Additional URL serving the same file; used in parallel with the primary. Repeatable. |
+| `--min-segment <bytes>` | Pin the chunk size. By default chunks are sized to give each connection about four units of work. |
+| `--timeout <seconds>` | Connect **and** receive timeout (default `30`). |
+| `--connect-timeout <s>` | Connect timeout only. |
+| `--no-resume` | Ignore and delete any previous partial state. |
+| `-f, --overwrite` | Overwrite an existing output file. |
+| `--no-progress` | Disable the live progress bar (useful for logs / scripts). |
+| `--proxy <url>` | Use an explicit proxy instead of the system proxy. |
+| `-A, --user-agent <ua>` | Override the `User-Agent` header. |
+| `-H, --header "Name: Value"` | Add a custom request header (repeatable). |
+| `--sha256 <hex>` | Verify the downloaded file against this SHA-256 digest; a mismatch fails the run with `ErrorCode::Verify`. |
+| `-q, --quiet` | Only warnings and errors. |
+| `-v, --verbose` | Debug logging (`-vv` for trace). |
+| `-h, --help` | Show help and exit. |
+| `-V, --version` | Show the version and exit. |
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | Download failed (network, HTTP, or I/O error) |
+| `2` | Invalid command line |
+| `130` | Interrupted by the user (`Ctrl+C`) |
+
+---
+
+## Examples
+
+```bat
+:: Simple download, 4 connections
+kdl https://example.com/file.iso
+
+:: 8 connections, explicit output path, overwrite if present
+kdl -t 8 -f -o D:\Downloads\file.iso https://example.com/file.iso
+
+:: Download into a directory (name derived from the URL)
+kdl -o D:\Downloads https://example.com/path/to/archive.tar.gz
+
+:: Authenticated request with a custom header
+kdl -H "Authorization: Bearer TOKEN" https://example.com/private.zip
+
+:: Download and verify against a published digest
+kdl --sha256 b4c5dfbe51a364a6c7f03869200f88c8e1f77403539005f14b7fc6bc91b8d8ba https://www.kernel.org/pub/linux/kernel/v7.x/linux-7.2.9.tar.xz
+
+:: Bound every connection to 60 seconds
+kdl --timeout 60 https://example.com/big.bin
+```
+
+---
+
+## How it works
+
+1. **Probe.** A `GET` with `Range: bytes=0-0` is issued. A `206` response proves range
+   support and yields the total size from `Content-Range`; a `200` means the server
+   ignored the range and the file will be downloaded as a single stream. `ETag` and
+   `Last-Modified` are captured for later validation, and the final (post-redirect)
+   URL is recorded.
+2. **Resolve the output path.** Derived from `Content-Disposition` (`filename*`
+   and `filename`), else from the URL path, sanitized for Windows. A directory
+   target gets the derived name appended.
+3. **Load resume state.** If a valid `.kdlpart` exists and the URL, size and
+   validators all match, the previous segment layout and offsets are restored.
+4. **Plan the segments.** The file is divided into equal byte ranges, sized so that
+   every connection has roughly four chunks of work to pull (`--min-segment` pins
+   the size explicitly). Servers without range support get a single sequential
+   segment.
+5. **Download.** A worker pool pulls chunks from a shared queue and commits every
+   received chunk at its absolute file offset through a single, mutex-protected
+   file handle. A resizable limiter gates how many workers may be inside a
+   transfer at once; the monitor thread uses it to grow the connection count
+   while throughput improves and to back off when connections fail. The monitor
+   also renders the progress bar and writes a resume checkpoint every two
+   seconds.
+6. **Finalize.** The file is flushed, the byte count is verified against the
+   expected size, the `.kdlpart` file is removed, and a summary is printed.
+
+### Cancellation
+
+`Ctrl+C` (or a console close/logoff/shutdown event) flips a shared `StopToken`.
+Workers poll the token inside the data callback, stop cleanly, and the current
+progress is written to `disk` before the process exits with code `130`. Nothing
+is left half-written: the output file already holds every byte that was
+acknowledged, and the sidecar records exactly how far each segment got.
+
+---
+
+## Resume semantics
+
+- State lives in `<output>.kdlpart`, written atomically (`write temp` + `MoveFileEx`),
+  so it is never observed half-written.
+- A checkpoint is written when the download starts and then every 2 seconds by the
+  monitor thread — enough to survive a hard `taskkill`.
+- The state is **rejected** (and deleted) when any of the following changed:
+  the URL, the total size, the `ETag`/`Last-Modified`, or the server stopped
+  advertising range support.
+- Because WinHTTP writes go through the OS file cache, data acknowledged to the
+  sidecar is durable even if the process is killed.
+- On success the sidecar is deleted; on failure it is kept so the next run resumes.
+
+---
+
+## Performance and tuning
+
+### Where the ceiling comes from
+
+Origin servers almost always throttle **per connection**. Measured against
+`mirrors.aliyun.com` (Tengine, HTTP/1.1) for a 153 MiB file, a single stream
+moves 0.25–0.31 MiB/s - and adding connections multiplies that until something
+else runs out:
+
+| Command | Time | Throughput |
+|---|---|---|
+| `kdl <url>` (adaptive, default) | 14.7–17.0 s | **9.0–10.4 MiB/s** |
+| `kdl --no-adaptive -t 16 <url>` | 38–40 s | 3.8–4.1 MiB/s |
+| `kdl --no-adaptive -t 128 <url>` | 14.9 s | 10.2 MiB/s |
+| `curl`, one connection | - | 0.25–0.31 MiB/s |
+
+Past ~128 connections nothing scales any more, and the evidence says the wall is
+the client's line rather than the server:
+
+- **Two processes are no faster than one.** 2 × `-t 128` simultaneously moved
+  4.8 + 4.7 MiB/s, i.e. the same total as a single `-t 128` run.
+- **Three independent hosts are no faster than one.** With `-m` pointing at
+  Tsinghua and NetEase as well, the total was again ~7–9 MiB/s, and 384
+  connections across three hosts were *slower* than 128 across one.
+- **It is not this program's CPU or disk.** At `-t 128` the process uses ~45 % of
+  a single core (≈5 % of the machine), and the data is written to an SSD.
+- The test machine reaches the same numbers on a 802.11ac link with a 50 % signal,
+  where the practical 802.11 goodput is exactly this ballpark.
+
+So the honest summary is: a throttling origin sets the *slope* (throughput ≈
+connections × per-connection cap), and the local link sets the *ceiling*. The
+first is worth fighting with concurrency; the second is not fightable in
+software - on this machine the same command measured 10.4 MiB/s and 6.3 MiB/s
+twenty minutes apart, which is the Wi-Fi, not the code. Chrome's 6–8 MB/s for
+the same file comes from opening many parallel requests, which is what `-t`
+does.
+
+### Adaptive concurrency
+
+Because the right connection count is a property of the path and not of the
+program, it is measured instead of guessed. The default run starts with a few
+connections and **doubles the count while the throughput keeps improving**; when
+it stops improving the count is held, and it is only reduced when connections
+*start failing* (timeouts, resets, `429`/`503`) - the one signal that cannot be
+caused by backing off. `-t` is the ceiling for that ramp, and `--no-adaptive`
+pins an exact count.
+
+Two measured pathologies shaped those rules:
+
+- Shrinking on a throughput dip alone is self-fulfilling: where the origin
+  throttles each connection, throughput is proportional to the connection count,
+  so backing off *makes* the rate fall, which triggers another back-off. An
+  earlier iteration of this controller walked itself from 128 connections down to
+  14 and turned a 15 second transfer into 50 seconds.
+- A ramp that is too slow is worse than no ramp at all: reaching 128 connections
+  two seconds in costs a short transfer nothing, whereas reaching it twenty
+  seconds in costs it everything past the halfway mark.
+
+Implementation notes that matter for throughput:
+
+- The body is read straight into a **256 KiB** buffer, bounded by the declared
+  `Content-Length`. `WinHttpQueryDataAvailable` is deliberately **not** called
+  before every read: it adds a blocking round-trip per chunk and cost ~30–50 %
+  of the achievable rate (1.0 → 1.5 MB/s at `-t 4`).
+- Work is pulled from a **shared queue** of ~4 chunks per connection, so a chunk
+  is a unit of scheduling rather than a fixed share of the file. A shallow queue
+  lets one slow connection decide when the whole transfer ends.
+- With `-m`, each endpoint is scored by delivered bytes per second and by how
+  much work is already assigned to it; a host that starts failing is dropped from
+  the rotation (other mirrors take its work) instead of being retried forever.
+- The progress rate is an **EWMA over 500 ms samples**; a raw per-sample delta
+  dips to zero whenever a sampling window contains no completed read.
+
+---
+
+## Testing
+
+A self-contained harness lives in `tools/`:
+
+| File | Purpose |
+|---|---|
+| `tools/gen.py` | Generates a 64 MiB random `downloads/big.bin` payload. |
+| `tools/gen.bat` | Wrapper that clears the Qt-provided `PYTHONHOME` and runs the generator. |
+| `tools/range_server.py` | A throttling local HTTP server with correct `Range` / `Content-Range` / `ETag` support. |
+| `tools/test_sha256.bat` | Verifies `--sha256`: a correct digest passes, a wrong one fails with `ErrorCode::Verify`. |
+| `tools/test_progress.bat` | Captures the progress bar frames and asserts the final one reaches 100%. |
+| `tools/test_local.bat` | End-to-end test: starts the server, downloads, hard-kills mid-transfer, prints the checkpoint, resumes, and compares MD5s. |
+| `tools/test_resume.bat` | The same idea against a public host (kept for reference). |
+
+Run the full local test:
+
+```bat
+tools\gen.bat
+tools\test_local.bat
+```
+
+A passing run shows live checkpoints growing, `resuming previous session`, a much
+shorter second run, and identical MD5 hashes for the source and the downloaded file.
+
+Verified behaviours:
+
+- Multi-segment download → MD5 matches the source (1 MiB from a public host, 64 MiB local).
+- Automatic recovery from `HTTP 429` via the retry/backoff path.
+- Hard kill at ~42 MiB → resume completes the remaining bytes → MD5 matches.
+
+---
+
+- **Verifiable downloads.** Multi-connection transfers can silently assemble a corrupt
+  file, so `--sha256` hashes the result with Windows CNG (`bcrypt.lib`) and refuses to
+  report success on a mismatch.
+## Design notes
+
+- **Zero third-party dependencies.** Networking is WinHTTP, file I/O is plain Win32.
+  UTF-8 is used everywhere inside the program; wide strings only at the Win32 boundary.
+- **Exceptions at thread boundaries only.** Worker bodies never leak exceptions;
+  they record an error on their segment instead.
+- **Lock-free hot path.** The only shared counters updated per chunk are relaxed
+  atomics; the file handle is protected by a short-lived mutex per write.
+- **Windows-only by construction.** `winhttp.lib` and `ws2_32.lib` are linked and
+  the code uses `HANDLE`/`CreateFileW` directly. A non-Windows configure fails fast.
+- **Known limitation.** A single-segment download of a resource with unknown length
+  (chunked, no `Content-Length`) cannot be resumed.
+
+---
+
+## Project layout
+
+```
+.
+├── CMakeLists.txt
+├── README.md
+├── .gitignore
+├── src
+│   ├── main.cpp               # entry point: argv, Ctrl+C handler, error → exit code
+│   ├── cli/
+│   │   ├── Options.h
+│   │   └── Options.cpp
+│   │   ├── Hash.h/.cpp        # SHA-256 (Windows CNG) for download verification
+│   ├── core/
+│   │   ├── Types.h            # u8/u16/u32/u64, kUnknownSize
+│   │   ├── Error.h/.cpp       # ErrorCode + Error
+│   │   ├── Logger.h/.cpp      # thread-safe timestamped logging
+│   │   ├── StringUtil.h/.cpp  # UTF-8 <-> UTF-16, trimming, parsing
+│   │   ├── ByteUtil.h/.cpp    # human-readable sizes / rates / durations
+│   │   └── StopToken.h        # cooperative cancellation
+│   ├── url/
+│   │   └── Url.h/.cpp         # HTTP/HTTPS URL parser
+│   ├── net/
+│   │   ├── HttpTypes.h        # HttpRequest / HttpResponse / HttpHeader
+│   │   └── HttpClient.h/.cpp  # WinHTTP backend
+│   ├── io/
+│   │   ├── FileWriter.h/.cpp  # thread-safe positional writes
+│   │   └── ResumeStore.h/.cpp # .kdlpart persistence
+│   ├── thread/
+│   │   └── ThreadPool.h/.cpp
+│   └── download/
+│       ├── Segment.h
+│       ├── Progress.h
+│       └── Downloader.h/.cpp
+└── tools/                     # local range server + end-to-end test scripts
+```

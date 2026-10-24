@@ -1,0 +1,2 @@
+b3cf80bf313e3d463f876113d7f355809de048208d479a08c69acf13a71084d2
+CertUtil: -hashfile 命令成功完成。
